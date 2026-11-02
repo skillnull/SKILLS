@@ -86,13 +86,46 @@ class PrivateContentTest(unittest.TestCase):
     def test_ignored_terms_are_loaded_but_not_published(self) -> None:
         self.environment.pop("PRIVATE_CONTENT_TERMS_JSON")
         self.write(".gitignore", ".privacy.local.json\n")
-        self.write(".privacy.local.json", json.dumps(["private-fixture"]))
+        terms_file = self.write(".privacy.local.json", json.dumps(["private-fixture"]))
+        terms_file.chmod(0o600)
         self.write("notes.md", "generic notes\n")
         self.assertEqual(self.scan("--require-private-terms").returncode, 0)
         self.git("add", "-f", ".privacy.local.json")
         result = self.scan("--staged")
         self.assertEqual(result.returncode, 1)
         self.assertIn("local-only-file", result.stderr)
+
+    def test_private_terms_file_requires_private_permissions(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX file permissions are not available on Windows.")
+        self.environment.pop("PRIVATE_CONTENT_TERMS_JSON")
+        terms_file = self.write(".privacy.local.json", json.dumps(["private-fixture"]))
+        terms_file.chmod(0o644)
+        result = self.scan("--require-private-terms")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must not grant group or other access", result.stderr)
+        self.assertNotIn("private-fixture", result.stderr)
+
+    def test_private_terms_file_rejects_dangling_symlinks(self) -> None:
+        if os.name == "nt":
+            self.skipTest("Symbolic-link behavior differs on Windows.")
+        self.environment.pop("PRIVATE_CONTENT_TERMS_JSON")
+        (self.repo / ".privacy.local.json").symlink_to("missing-private-terms.json")
+        result = self.scan("--require-private-terms")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must be a regular file", result.stderr)
+
+    def test_json_output_is_structured_and_redacted(self) -> None:
+        self.write("notes.md", "private-fixture\n")
+        result = self.scan("--format", "json")
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["exit_code"], 1)
+        self.assertTrue(payload["private_terms_configured"])
+        self.assertIn("private-term", payload["failures"][0])
+        self.assertNotIn("private-fixture", result.stdout)
+        self.assertEqual(result.stderr, "")
 
     def test_missing_empty_and_invalid_terms_block_required_scan(self) -> None:
         for value in ("", "[]", "{invalid private-fixture", '[""]', '{"terms": []}'):
@@ -156,6 +189,10 @@ class PrivateContentTest(unittest.TestCase):
 
     def test_real_commit_hooks_block_files_and_messages(self) -> None:
         self.write("scripts/check_private_content.py", SCANNER.read_text(encoding="utf-8"))
+        self.write(
+            "scripts/validate_project.py",
+            "#!/usr/bin/env python3\nraise SystemExit(0)\n",
+        )
         shutil.copytree(PROJECT_ROOT / ".githooks", self.repo / ".githooks")
         self.git("config", "core.hooksPath", ".githooks")
         self.write("notes.md", "private-fixture\n")

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,8 +26,11 @@ class SkillnullGateTest(unittest.TestCase):
 		self.repo_root = Path(self.temporary_directory.name)
 		subprocess.run(["git", "init", "-q", str(self.repo_root)], check=True)
 		(self.repo_root / "src").mkdir()
+		self.original_state_root = skillnull_gate.STATE_ROOT
+		skillnull_gate.STATE_ROOT = self.repo_root / ".state"
 
 	def tearDown(self) -> None:
+		skillnull_gate.STATE_ROOT = self.original_state_root
 		self.temporary_directory.cleanup()
 
 	def write_source(self, relative_path: str, content: str) -> Path:
@@ -43,7 +48,7 @@ class SkillnullGateTest(unittest.TestCase):
 *** End Patch
 """
 		reason, touched = skillnull_gate.check_patch(
-			self.repo_root, patch_text, "修复页面"
+			self.repo_root, patch_text, False
 		)
 		self.assertIn("清空源码", reason)
 		self.assertEqual(touched, ["src/hooks.ts"])
@@ -58,7 +63,7 @@ class SkillnullGateTest(unittest.TestCase):
 *** End Patch
 """
 		reason, touched = skillnull_gate.check_patch(
-			self.repo_root, patch_text, "更新数值"
+			self.repo_root, patch_text, False
 		)
 		self.assertIsNone(reason)
 		self.assertEqual(touched, ["src/value.ts"])
@@ -73,7 +78,7 @@ class SkillnullGateTest(unittest.TestCase):
 *** End Patch
 """
 		reason, _touched = skillnull_gate.check_patch(
-			self.repo_root, patch_text, "删除旧 hooks"
+			self.repo_root, patch_text, True
 		)
 		self.assertIn("仍被引用", reason)
 
@@ -89,7 +94,7 @@ class SkillnullGateTest(unittest.TestCase):
 *** End Patch
 """
 		reason, _touched = skillnull_gate.check_patch(
-			self.repo_root, patch_text, "修改页面"
+			self.repo_root, patch_text, False
 		)
 		self.assertIn("删除 import 后仍使用 useQuery", reason)
 
@@ -107,7 +112,7 @@ class SkillnullGateTest(unittest.TestCase):
 *** End Patch
 """
 		reason, _touched = skillnull_gate.check_patch(
-			self.repo_root, patch_text, "替换查询逻辑"
+			self.repo_root, patch_text, True
 		)
 		self.assertIsNone(reason)
 
@@ -148,6 +153,7 @@ class SkillnullGateTest(unittest.TestCase):
 			capture_output=True,
 			text=True,
 			check=True,
+			env={**os.environ, "HOME": str(self.repo_root)},
 		)
 		output = json.loads(result.stdout)
 		self.assertEqual(
@@ -158,6 +164,74 @@ class SkillnullGateTest(unittest.TestCase):
 			output["hookSpecificOutput"]["additionalContext"],
 		)
 
+	def test_state_keeps_only_the_removal_decision(self) -> None:
+		session_id = "state-privacy-test-session"
+		skillnull_gate.handle_user_prompt(
+			{
+				"session_id": session_id,
+				"cwd": str(self.repo_root),
+				"prompt": "删除不再需要的旧文件",
+			}
+		)
+		state = skillnull_gate.load_state(session_id)
+		self.assertNotIn("prompt", state)
+		self.assertTrue(state["removal_authorized"])
+		if os.name != "nt":
+			state_mode = stat.S_IMODE(
+				skillnull_gate.state_path(session_id).stat().st_mode
+			)
+			self.assertEqual(state_mode, 0o600)
+
+	def test_negated_removal_is_not_authorized(self) -> None:
+		self.assertFalse(skillnull_gate.has_removal_authorization("不要删除任何文件"))
+		self.assertFalse(skillnull_gate.has_removal_authorization("do not delete files"))
+		self.assertTrue(skillnull_gate.has_removal_authorization("删除旧文件"))
+
+	def test_successful_stop_removes_session_state(self) -> None:
+		session_id = "completed-session"
+		skillnull_gate.handle_user_prompt(
+			{
+				"session_id": session_id,
+				"cwd": str(self.repo_root),
+				"prompt": "修改代码",
+			}
+		)
+		self.assertTrue(skillnull_gate.state_path(session_id).exists())
+		self.assertEqual(
+			skillnull_gate.handle_stop(
+				{"session_id": session_id, "cwd": str(self.repo_root)}
+			),
+			{},
+		)
+		self.assertFalse(skillnull_gate.state_path(session_id).exists())
+
+	def test_prompt_wording_does_not_disable_normal_tool_use(self) -> None:
+		session_id = "normal-tool-use-test-session"
+		self.addCleanup(
+			skillnull_gate.state_path(session_id).unlink, missing_ok=True
+		)
+		prompt_output = skillnull_gate.handle_user_prompt(
+			{
+				"hook_event_name": "UserPromptSubmit",
+				"session_id": session_id,
+				"cwd": str(self.repo_root),
+				"prompt": "修改 Skill 与系统提示词相关的输出格式",
+			}
+		)
+		context = prompt_output["hookSpecificOutput"]["additionalContext"]
+		self.assertIn("SKILLNULL — 编写与迭代守则", context)
+
+		tool_output = skillnull_gate.handle_pre_tool(
+			{
+				"hook_event_name": "PreToolUse",
+				"session_id": session_id,
+				"cwd": str(self.repo_root),
+				"tool_name": "exec_command",
+				"tool_input": {"cmd": "pwd"},
+			}
+		)
+		self.assertEqual(tool_output, {})
+
 	def test_relocated_hook_loads_adjacent_rules_through_symlink(self) -> None:
 		relocated_script = self.write_source(
 			"relocated/scripts/skillnull_gate.py",
@@ -166,6 +240,9 @@ class SkillnullGateTest(unittest.TestCase):
 		self.write_source("relocated/SKILL.md", "portable main rules\n")
 		local_rules = self.write_source(
 			"relocated/SKILL.local.md", "portable local rules\n"
+		)
+		self.write_source(
+			"relocated/.privacy.local.json", '["private-sentinel"]\n'
 		)
 		linked_directory = self.repo_root / "linked-skill"
 		linked_directory.symlink_to(relocated_script.parent.parent, target_is_directory=True)
@@ -188,10 +265,12 @@ class SkillnullGateTest(unittest.TestCase):
 					capture_output=True,
 					text=True,
 					check=True,
+					env={**os.environ, "HOME": str(self.repo_root)},
 				)
 				context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
 				self.assertIn("portable main rules", context)
 				self.assertEqual("portable local rules" in context, include_local)
+				self.assertNotIn("private-sentinel", context)
 				self.assertNotIn("## 本地知识库", context)
 
 

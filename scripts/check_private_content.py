@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -51,7 +52,15 @@ def git(repo: Path, *arguments: str) -> bytes:
 def load_terms(repo: Path, required: bool) -> list[str]:
     sources = []
     local_file = repo / LOCAL_TERMS_FILE
+    if local_file.is_symlink():
+        raise ScanError("Private terms file must be a regular file.")
     if local_file.exists():
+        if not local_file.is_file():
+            raise ScanError("Private terms file must be a regular file.")
+        if os.name != "nt" and stat.S_IMODE(local_file.stat().st_mode) & 0o077:
+            raise ScanError(
+                "Private terms file must not grant group or other access (use 600)."
+            )
         sources.append(local_file.read_text(encoding="utf-8"))
     if os.environ.get(TERMS_ENV):
         sources.append(os.environ[TERMS_ENV])
@@ -69,6 +78,38 @@ def load_terms(repo: Path, required: bool) -> list[str]:
     if required and not terms:
         raise ScanError("Private terms missing; configure local terms or the CI secret.")
     return sorted(terms)
+
+
+def emit_result(
+    output_format: str,
+    status: str,
+    exit_code: int,
+    failures: list[str],
+    message: str,
+    private_terms_configured: bool,
+) -> None:
+    unique_failures = list(dict.fromkeys(failures))
+    if output_format == "json":
+        print(
+            json.dumps(
+                {
+                    "status": status,
+                    "exit_code": exit_code,
+                    "failures": unique_failures,
+                    "message": message,
+                    "private_terms_configured": private_terms_configured,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
+    if status == "blocked":
+        print("Private content gate blocked publication:", file=sys.stderr)
+        for failure in unique_failures:
+            print(f"  {failure}", file=sys.stderr)
+        return
+    output = sys.stderr if status == "error" else sys.stdout
+    print(message, file=output)
 
 
 class Scanner:
@@ -171,6 +212,13 @@ def main() -> int:
     parser.add_argument("--history", action="store_true", help="Also audit all reachable commits and tags.")
     parser.add_argument("--message-file", type=Path, help="Check a pending commit message.")
     parser.add_argument("--require-private-terms", action="store_true", help="Fail if no private terms are configured.")
+    parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        dest="output_format",
+        help="Choose human-readable text or machine-readable JSON output.",
+    )
     options = parser.parse_args()
     try:
         repo = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip())
@@ -184,15 +232,30 @@ def main() -> int:
         if options.history:
             scanner.check_history()
         if scanner.failures:
-            print("Private content gate blocked publication:", file=sys.stderr)
-            for failure in dict.fromkeys(scanner.failures):
-                print(f"  {failure}", file=sys.stderr)
+            emit_result(
+                options.output_format,
+                "blocked",
+                1,
+                scanner.failures,
+                "Private content gate blocked publication.",
+                bool(scanner.terms),
+            )
             return 1
-        print("Private content gate passed" + (" (generic patterns only)." if not scanner.terms else "."))
+        message = "Private content gate passed" + (
+            " (generic patterns only)." if not scanner.terms else "."
+        )
+        emit_result(
+            options.output_format,
+            "passed",
+            0,
+            [],
+            message,
+            bool(scanner.terms),
+        )
         return 0
     except (ScanError, OSError, UnicodeError) as error:
         message = str(error) if isinstance(error, ScanError) else "Unreadable input; scan incomplete."
-        print(message, file=sys.stderr)
+        emit_result(options.output_format, "error", 2, [], message, False)
         return 2
 
 

@@ -45,6 +45,13 @@ REMOVAL_WORDS = re.compile(
 	r"删除|移除|废弃|下线|清空|重写|替换|remove|delete|deprecate|rewrite|replace",
 	re.IGNORECASE,
 )
+REMOVAL_DENIAL_WORDS = re.compile(
+	r"(?:不要|不得|不能|不可|不需要|无需|禁止|避免)\s*"
+	r"(?:删除|移除|废弃|下线|清空|重写|替换)"
+	r"|(?:do\s+not|don't|must\s+not|without)\s+"
+	r"(?:remove|delete|deprecate|rewrite|replace)",
+	re.IGNORECASE,
+)
 IMPORT_PATTERN = re.compile(
 	r"\bimport\s+(?:type\s+)?(.+?)\s+from\s+[\"'][^\"']+[\"']\s*;?",
 	re.DOTALL,
@@ -101,13 +108,24 @@ def load_state(session_id: str) -> dict[str, Any]:
 
 
 def save_state(session_id: str, state: dict[str, Any]) -> None:
-	STATE_ROOT.mkdir(parents=True, exist_ok=True)
+	STATE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+	if os.name != "nt":
+		STATE_ROOT.chmod(0o700)
 	path = state_path(session_id)
 	temporary_path = path.with_suffix(".tmp")
 	temporary_path.write_text(
 		json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
 	)
+	if os.name != "nt":
+		temporary_path.chmod(0o600)
 	temporary_path.replace(path)
+
+
+def clear_state(session_id: str) -> None:
+	try:
+		state_path(session_id).unlink()
+	except FileNotFoundError:
+		pass
 
 
 def diff_check_lines(repo_root: Path) -> list[str]:
@@ -150,6 +168,12 @@ def extract_prompt(payload: dict[str, Any]) -> str:
 		if isinstance(value, str):
 			return value
 	return ""
+
+
+def has_removal_authorization(prompt: str) -> bool:
+	return bool(REMOVAL_WORDS.search(prompt)) and not REMOVAL_DENIAL_WORDS.search(
+		prompt
+	)
 
 
 def extract_tool_text(payload: dict[str, Any]) -> str:
@@ -317,7 +341,7 @@ def deny_pretool(reason: str) -> dict[str, Any]:
 
 
 def check_patch(
-	repo_root: Path, patch_text: str, prompt: str
+	repo_root: Path, patch_text: str, removal_authorized: bool
 ) -> tuple[str | None, list[str]]:
 	repo_root = repo_root.resolve()
 	touched: list[str] = []
@@ -351,7 +375,7 @@ def check_patch(
 					f"引用示例：{references[0]}",
 					touched,
 				)
-			if not REMOVAL_WORDS.search(prompt):
+			if not removal_authorized:
 				return (
 					f"SKILLNULL 门禁：删除源码 {relative_target} 未得到当前用户请求的明确授权。",
 					touched,
@@ -373,7 +397,7 @@ def check_patch(
 			and removed_count >= current_line_count / 2
 			and added_count * 3 < removed_count
 		)
-		if large_shrink and not REMOVAL_WORDS.search(prompt):
+		if large_shrink and not removal_authorized:
 			return (
 				f"SKILLNULL 门禁：{relative_target} 将大幅缩减"
 				f"（删 {removed_count} 行、增 {added_count} 行），但当前请求未明确要求删除/重写。",
@@ -409,17 +433,13 @@ def handle_user_prompt(payload: dict[str, Any]) -> dict[str, Any]:
 	if repo_root is None:
 		return {}
 	session_id = str(payload.get("session_id") or "unknown-session")
-	state = load_state(session_id)
-	state.update(
-		{
-			"repo_root": str(repo_root),
-			"turn_id": str(payload.get("turn_id") or ""),
-			"prompt": extract_prompt(payload),
-			"baseline_diff_check": diff_check_lines(repo_root),
-			"baseline_zero_sources": working_tree_zero_sources(repo_root),
-			"touched_files": [],
-		}
-	)
+	prompt = extract_prompt(payload)
+	state = {
+		"removal_authorized": has_removal_authorization(prompt),
+		"baseline_diff_check": diff_check_lines(repo_root),
+		"baseline_zero_sources": working_tree_zero_sources(repo_root),
+		"touched_files": [],
+	}
 	try:
 		skill_context = load_skill_context()
 		state["skill_loaded"] = True
@@ -463,7 +483,7 @@ def handle_pre_tool(payload: dict[str, Any]) -> dict[str, Any]:
 				)
 	if "apply_patch" in tool_name.lower():
 		reason, touched = check_patch(
-			repo_root, tool_text, str(state.get("prompt") or "")
+			repo_root, tool_text, bool(state.get("removal_authorized"))
 		)
 		state["touched_files"] = sorted(
 			set(state.get("touched_files", [])) | set(touched)
@@ -499,6 +519,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
 	session_id = str(payload.get("session_id") or "unknown-session")
 	failures = current_gate_failures(repo_root, load_state(session_id))
 	if not failures:
+		clear_state(session_id)
 		return {}
 	return {
 		"decision": "block",

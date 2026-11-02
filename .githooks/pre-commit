@@ -1,3 +1,5 @@
 #!/bin/sh
 set -eu
-exec python3 "$(git rev-parse --show-toplevel)/scripts/check_private_content.py" --staged --history --require-private-terms
+repository_root="$(git rev-parse --show-toplevel)"
+python3 "$repository_root/scripts/validate_project.py"
+exec python3 "$repository_root/scripts/check_private_content.py" --staged --history --require-private-terms

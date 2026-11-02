@@ -12,6 +12,7 @@ lerna-debug.log*
 # Local skill configuration
 /SKILL.local.md
 /.privacy.local.json
+/eval-workspaces/
 
 # Python bytecode
 __pycache__/
