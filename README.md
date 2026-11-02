@@ -1,5 +1,12 @@
 # SKILLNULL
 
+[![CI](https://img.shields.io/badge/CI-GitHub%20Actions-2088FF?logo=githubactions&logoColor=white)](.github/workflows/privacy.yml)
+[![Agent Skills](https://img.shields.io/badge/Agent%20Skills-compatible-6f42c1)](https://agentskills.io/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+*A production-minded rule set and deterministic safety toolkit for reliable AI-assisted software development.*
+
 面向 AI 编程助手的开发与交付规则集。把代码改动边界、问题排查、工程实践和交付验证整理成可复用的约束，适用于个人开发与团队协作。
 
 ## 包含内容
